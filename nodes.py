@@ -775,10 +775,13 @@ _LAST_BATCH_ASSET_REFS_TTL = 3600
 PLUGIN_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 SETTINGS_FILE = os.path.join(DATA_DIR, "cometapi_settings.json")
+COMET_RUN_CACHE_FILE = os.path.join(DATA_DIR, "cometapi_run_cache.json")
+COMET_GLOBAL_RUN_FREEZE_MODE = "global_freeze"
 ANNOUNCEMENT_URL = "https://cnb.cool/nkxx666/comfyui_cpu_nkxx/-/git/raw/main/announcement.md"
 ANNOUNCEMENT_CACHE_FILE = os.path.join(DATA_DIR, "cometapi_announcement_cache.json")
 ANNOUNCEMENT_CACHE_TTL_SECONDS = 24 * 60 * 60
 ANNOUNCEMENT_REQUEST_TIMEOUT = (3, 5)
+_COMET_RUN_CACHE_LOCK = threading.RLock()
 
 GRSAI_MODEL_ALIASES = {model: model.replace("nano-", "") if model.startswith("nano-") else model for model in (GPT_IMAGE_MODELS + NANO_BANANA_MODELS)}
 PRIVATE_MODEL_ALIASES = {
@@ -1782,6 +1785,9 @@ def default_comet_settings() -> dict:
     settings = {
         "version": 2,
         "advanced": {
+            "global_run": {
+                "freeze_comet_nodes": False,
+            },
             "batch_image": {
                 "batch_concurrency": 20,
                 "max_tasks": 200,
@@ -1823,6 +1829,13 @@ def normalize_comet_settings(data: dict | None) -> dict:
         return settings
 
     input_advanced = data.get("advanced") if isinstance(data.get("advanced"), dict) else {}
+    input_global_run = input_advanced.get("global_run") if isinstance(input_advanced.get("global_run"), dict) else {}
+    raw_freeze = input_global_run.get("freeze_comet_nodes")
+    if isinstance(raw_freeze, str):
+        settings["advanced"]["global_run"]["freeze_comet_nodes"] = raw_freeze.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        settings["advanced"]["global_run"]["freeze_comet_nodes"] = bool(raw_freeze)
+
     input_batch_image = input_advanced.get("batch_image") if isinstance(input_advanced.get("batch_image"), dict) else {}
     settings["advanced"]["batch_image"]["batch_concurrency"] = _coerce_int(
         input_batch_image.get("batch_concurrency"),
@@ -2280,7 +2293,7 @@ def get_channel_api_url(channel: str = "grsai") -> str:
     if channel_key == "modelverse":
         return "https://api.modelverse.cn"
     if channel_key == "apimart":
-        return "https://api.apimart.ai"
+        return "https://api.apib.ai"
     return ""
 
 
@@ -3430,6 +3443,223 @@ def concat_audio_results(audios: list[dict], silence_seconds: float = 0.6) -> di
     return {"waveform": torch.cat(pieces, dim=2).clamp(-1.0, 1.0), "sample_rate": sample_rate}
 
 
+def add_comet_execution_inputs(inputs: dict) -> dict:
+    """Add hidden/internal execution controls shared by Comet API work nodes."""
+    if not isinstance(inputs, dict):
+        return inputs
+    optional = inputs.setdefault("optional", {})
+    optional.setdefault("_comet_run_mode", ("STRING", {"default": "", "multiline": False}))
+    hidden = inputs.setdefault("hidden", {})
+    hidden.setdefault("_unique_id", "UNIQUE_ID")
+    return inputs
+
+
+def is_comet_global_freeze_run(kwargs: dict | None) -> bool:
+    if not isinstance(kwargs, dict):
+        return False
+    mode = str(kwargs.get("_comet_run_mode") or "").strip().lower()
+    return mode in {COMET_GLOBAL_RUN_FREEZE_MODE, "freeze", "frozen", "global-freeze", "global_run_freeze"}
+
+
+def comet_freeze_missing_message(label: str) -> str:
+    return (
+        f"总 Run 冻结已启用：{label}节点没有可复用的上次成功结果，"
+        "也没有可安全透传的同类型输入。本次已阻止执行，避免用空结果覆盖下游内容。"
+        "请先用节点上的单点运行生成一次，或把结果接到 Comet 卡片保存。"
+    )
+
+
+def _snapshot_asset_refs(asset_refs: str | dict | list | None) -> list[dict]:
+    snapshot = []
+    for ref in normalize_asset_refs(asset_refs):
+        item = {
+            "filename": ref.get("filename"),
+            "subfolder": ref.get("subfolder", ""),
+            "type": ref.get("type", "output"),
+        }
+        if ref.get("absolute_path"):
+            item["absolute_path"] = ref["absolute_path"]
+        if item["filename"]:
+            snapshot.append(item)
+    return snapshot
+
+
+def _read_comet_run_cache_unlocked() -> dict:
+    if not os.path.exists(COMET_RUN_CACHE_FILE):
+        return {}
+    try:
+        with open(COMET_RUN_CACHE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning(f"Failed to read Comet run cache: {redact_sensitive_text(exc)}")
+        return {}
+
+
+def _write_comet_run_cache_unlocked(cache: dict) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(COMET_RUN_CACHE_FILE, "w", encoding="utf-8") as handle:
+        json.dump(cache if isinstance(cache, dict) else {}, handle, ensure_ascii=False, indent=2)
+
+
+def remember_comet_run_result(
+    node_id: str | int | None,
+    kind: str,
+    *,
+    text: str = "",
+    asset_refs: str | dict | list | None = None,
+    video_url: str = "",
+    task_id: str = "",
+) -> None:
+    key = str(node_id or "").strip()
+    if not key:
+        return
+    record = {
+        "kind": str(kind or "").strip(),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if text:
+        record["text"] = redact_sensitive_text(text)
+    refs = _snapshot_asset_refs(asset_refs)
+    if refs:
+        record["asset_refs"] = refs
+    if video_url:
+        record["video_url"] = redact_sensitive_text(video_url)
+    if task_id:
+        record["task_id"] = redact_sensitive_text(task_id)
+    with _COMET_RUN_CACHE_LOCK:
+        cache = _read_comet_run_cache_unlocked()
+        cache[key] = record
+        try:
+            _write_comet_run_cache_unlocked(cache)
+        except Exception as exc:
+            logger.warning(f"Failed to write Comet run cache: {redact_sensitive_text(exc)}")
+
+
+def get_comet_run_result(node_id: str | int | None, kinds: set[str] | tuple[str, ...] | list[str] | None = None) -> dict | None:
+    key = str(node_id or "").strip()
+    if not key:
+        return None
+    with _COMET_RUN_CACHE_LOCK:
+        entry = copy.deepcopy(_read_comet_run_cache_unlocked().get(key))
+    if not isinstance(entry, dict):
+        return None
+    if kinds:
+        allowed = {str(item) for item in kinds}
+        if str(entry.get("kind") or "") not in allowed:
+            return None
+    return entry
+
+
+def _cached_image_payload(node_id: str | int | None, kinds: set[str] | tuple[str, ...] | list[str]) -> tuple[torch.Tensor | None, dict, str]:
+    entry = get_comet_run_result(node_id, kinds)
+    refs = _snapshot_asset_refs(entry.get("asset_refs") if entry else None)
+    if not refs:
+        return None, {}, str(entry.get("text") or "") if entry else ""
+    images = []
+    for ref in refs:
+        images.append(load_asset_image(ref))
+    ui = {"asset_ref": [asset_refs_to_json(refs)], "asset_index": [0]}
+    text = str(entry.get("text") or "")
+    if text:
+        ui["comet_text"] = [text]
+    return _batch_image_tensor(images), ui, text
+
+
+def _passthrough_image_tensor(kwargs: dict | None) -> torch.Tensor | None:
+    if not isinstance(kwargs, dict):
+        return None
+    direct = kwargs.get("images")
+    if isinstance(direct, torch.Tensor):
+        return direct
+    images = []
+    for i in range(1, MAX_IMAGE_INPUTS + 1):
+        value = kwargs.get(f"image_{i}")
+        if not isinstance(value, torch.Tensor):
+            continue
+        images.extend(safe_pil_for_tensor(image, preserve_alpha=True) for image in tensor_to_pil(value))
+    return _batch_image_tensor(images) if images else None
+
+
+def _cached_text_payload(node_id: str | int | None, kinds: set[str] | tuple[str, ...] | list[str]) -> str:
+    entry = get_comet_run_result(node_id, kinds)
+    return str(entry.get("text") or "") if entry else ""
+
+
+def _infer_passthrough_media_type(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, torch.Tensor):
+        return "image"
+    if isinstance(value, dict) and "waveform" in value:
+        return "audio"
+    return "video"
+
+
+def _passthrough_video(kwargs: dict | None):
+    if not isinstance(kwargs, dict):
+        return None
+    direct = kwargs.get("media")
+    if direct is not None and _infer_passthrough_media_type(direct) == "video":
+        return direct
+    for i in range(1, MAX_VIDEO_MEDIA_INPUTS + 1):
+        value = kwargs.get(f"media_{i}")
+        if value is None:
+            continue
+        media_type = str(kwargs.get(f"media_type_{i}") or "").strip().lower()
+        if media_type not in {"image", "video", "audio"}:
+            media_type = _infer_passthrough_media_type(value)
+        if media_type == "video":
+            return value
+    return None
+
+
+def _cached_video_payload(node_id: str | int | None, kinds: set[str] | tuple[str, ...] | list[str]) -> tuple[VideoAdapter | None, dict, str]:
+    entry = get_comet_run_result(node_id, kinds)
+    refs = _snapshot_asset_refs(entry.get("asset_refs") if entry else None)
+    if not refs:
+        return None, {}, str(entry.get("text") or "") if entry else ""
+    ref = refs[0]
+    adapter = load_asset_video(ref)
+    adapter.video_url = str(entry.get("video_url") or "")
+    ui = video_card_ui(ref)
+    if entry.get("video_url"):
+        ui["comet_video_url"] = [str(entry.get("video_url") or "")]
+    if entry.get("task_id"):
+        ui["comet_task_id"] = [str(entry.get("task_id") or "")]
+    text = str(entry.get("text") or "")
+    if text:
+        ui["comet_text"] = [text]
+    return adapter, ui, text
+
+
+def _cached_audio_payload(node_id: str | int | None) -> tuple[dict | None, dict, str]:
+    entry = get_comet_run_result(node_id, {"music"})
+    if not entry:
+        return None, {}, ""
+    refs = _snapshot_asset_refs(entry.get("asset_refs"))
+    text = str(entry.get("text") or "")
+    if refs:
+        audios = [load_audio_file(asset_abs_path(ref)) for ref in refs]
+        audio = concat_audio_results(audios)
+        audio["comet_audio_refs"] = refs
+        ui = {"asset_ref": [asset_refs_to_json(refs)]}
+        if text:
+            ui["comet_text"] = [text]
+        return audio, ui, text
+    return None, {}, ""
+
+
+def _ensure_audio_asset_refs(audio: dict, prefix: str = "CometAPIMusic") -> list[dict]:
+    refs = normalize_asset_refs(audio.get("comet_audio_refs")) if isinstance(audio, dict) else []
+    if refs:
+        return refs
+    refs = save_asset_audio(audio, prefix)
+    if isinstance(audio, dict):
+        audio["comet_audio_refs"] = refs
+    return refs
+
+
 GRSAI_IMAGE_REQUEST_TIMEOUT_SECONDS = 900
 
 
@@ -4085,7 +4315,7 @@ class ModelVerseImageAPI:
 
 
 class APIMartImageAPI:
-    host = "https://api.apimart.ai"
+    host = "https://api.apib.ai"
 
     def __init__(self, api_key: str):
         if not api_key:
@@ -7406,8 +7636,8 @@ def apimart_allowed_media_types(model: str, mode: str = "") -> set[str]:
 
 
 class APIMartVideoAPI:
-    host = "https://api.apimart.ai"
-    upload_host = "https://apimart.ai"
+    host = "https://api.apib.ai"
+    upload_host = "https://apib.ai"
 
     def __init__(self, api_key: str, media_upload_api_key: str = "", grsai_media_upload_api_key: str = ""):
         if not api_key:
@@ -8185,12 +8415,16 @@ def _call_claude_api(api_key: str, model: str, messages: list, api_url: str = ""
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
     }
+    system_messages = [msg.get("content", "") for msg in messages if msg.get("role") == "system"]
+    chat_messages = [msg for msg in messages if msg.get("role") != "system"]
     payload = {
         "model": model,
-        "messages": messages,
+        "messages": chat_messages,
         "max_tokens": DEFAULT_LLM_MAX_OUTPUT_TOKENS,
         "temperature": 0.7,
     }
+    if system_messages:
+        payload["system"] = "\n\n".join(str(item) for item in system_messages if item)
     response = requests.post(url, headers=headers, json=payload, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
     response.raise_for_status()
     data = response.json()
@@ -8747,19 +8981,32 @@ def build_llm_messages(
     video_paths: list[str] | None = None,
     audio_paths: list[str] | None = None,
     api_format: str = "gemini",
+    system_prompt: str = "",
 ) -> list:
     """构建LLM消息格式"""
+    system_prompt = str(system_prompt or "").strip()
     video_paths = [path for path in (video_paths or []) if path and os.path.exists(path)]
     audio_paths = [path for path in (audio_paths or []) if path and os.path.exists(path)]
     if not pil_images and not video_paths and not audio_paths:
         if api_format == "gemini":
-            return [{"role": "user", "parts": [{"text": prompt}]}]
+            parts = []
+            if system_prompt:
+                parts.append({"text": f"System instruction:\n{system_prompt}"})
+            parts.append({"text": prompt})
+            return [{"role": "user", "parts": parts}]
         else:
-            return [{"role": "user", "content": prompt}]
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            return messages
     
     # 多模态消息
     if api_format == "gemini":
-        parts = [{"text": prompt}]
+        parts = []
+        if system_prompt:
+            parts.append({"text": f"System instruction:\n{system_prompt}"})
+        parts.append({"text": prompt})
         for pil_image in pil_images:
             buffered = BytesIO()
             safe_pil_to_rgb(pil_image).save(buffered, format="JPEG", quality=90)
@@ -8799,7 +9046,11 @@ def build_llm_messages(
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"},
             })
-        return [{"role": "user", "content": content}]
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": content})
+        return messages
     elif api_format == "claude":
         content = []
         for pil_image in pil_images:
@@ -8811,9 +9062,17 @@ def build_llm_messages(
                 "source": {"type": "base64", "media_type": "image/jpeg", "data": img_base64},
             })
         content.append({"type": "text", "text": prompt})
-        return [{"role": "user", "content": content}]
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": content})
+        return messages
     else:
-        return [{"role": "user", "content": prompt}]
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        return messages
 
 
 class CometAPIUnifiedLLMNode:
@@ -8829,6 +9088,8 @@ class CometAPIUnifiedLLMNode:
             "required": {
                 "channel": (get_llm_channel_choices(), {"default": "grsai"}),
                 "model": (get_llm_model_choices(), {"default": "gemini-3-flash"}),
+                "system_prompt_mode": (["默认", "高级"], {"default": "默认"}),
+                "system_prompt": ("STRING", {"multiline": True, "default": "", "placeholder": "系统提示词；高级模式下生效"}),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
             },
             "optional": {
@@ -8841,7 +9102,7 @@ class CometAPIUnifiedLLMNode:
             inputs["optional"][f"video_{i}"] = (IO.VIDEO,)
         for i in range(1, MAX_LLM_AUDIO_INPUTS + 1):
             inputs["optional"][f"audio_{i}"] = (getattr(IO, "AUDIO", "AUDIO"),)
-        return inputs
+        return add_comet_execution_inputs(inputs)
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -8885,10 +9146,18 @@ class CometAPIUnifiedLLMNode:
         self,
         channel: str,
         model: str,
-        prompt: str,
+        system_prompt_mode: str = "默认",
+        system_prompt: str = "",
+        prompt: str = "",
         api_key: str = "",
         **kwargs,
     ):
+        if is_comet_global_freeze_run(kwargs):
+            cached_text = _cached_text_payload(kwargs.get("_unique_id"), {"text"})
+            if cached_text:
+                return {"ui": {"comet_text": [cached_text], "string": [cached_text]}, "result": (cached_text,)}
+            raise CometAPIError(comet_freeze_missing_message("文本"))
+
         channel = str(channel or "grsai").lower()
         if channel not in get_llm_channel_choices():
             return self._error(f"不支持的渠道：{channel}")
@@ -8903,13 +9172,14 @@ class CometAPIUnifiedLLMNode:
         api_url = get_channel_api_url(channel)
 
         try:
+            system_prompt = str(system_prompt or "").strip() if str(system_prompt_mode or "") == "高级" else ""
             pil_images = self._collect_input_pils(kwargs)
             video_paths = self._collect_input_videos(kwargs)
             audio_paths = self._collect_input_audios(kwargs)
             if (video_paths or audio_paths) and api_format != "gemini":
                 return self._error("当前 LLM 的视频/音频输入只支持 Gemini 接口格式模型，请在设置中心或横条里切换模型。")
             
-            messages = build_llm_messages(prompt, pil_images, video_paths, audio_paths, api_format)
+            messages = build_llm_messages(prompt, pil_images, video_paths, audio_paths, api_format, system_prompt=system_prompt)
             
             if get_private_channel_spec(channel):
                 response_text, error_msg = run_private_llm_channel(
@@ -8922,6 +9192,7 @@ class CometAPIUnifiedLLMNode:
                     audio_paths=audio_paths,
                     messages=messages,
                     api_format=api_format,
+                    system_prompt=system_prompt,
                 )
             else:
                 response_text, error_msg = call_llm_api(final_api_key, model, messages, api_format, api_url)
@@ -8933,6 +9204,7 @@ class CometAPIUnifiedLLMNode:
             if not response_text:
                 return self._error("API 返回了空响应。")
             
+            remember_comet_run_result(kwargs.get("_unique_id"), "text", text=response_text)
             return {"ui": {}, "result": (response_text,)}
         except Exception as exc:
             print_sanitized_exception(exc)
@@ -8968,7 +9240,7 @@ class CometAPIUnifiedImage:
         # compiles its links into image_1...image_14 before ComfyUI validates.
         for i in range(1, MAX_IMAGE_INPUTS + 1):
             inputs["optional"][f"image_{i}"] = ("IMAGE",)
-        return inputs
+        return add_comet_execution_inputs(inputs)
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -9048,6 +9320,15 @@ class CometAPIUnifiedImage:
         api_key: str = "",
         **kwargs,
     ):
+        if is_comet_global_freeze_run(kwargs):
+            cached_image, cached_ui, _text = _cached_image_payload(kwargs.get("_unique_id"), {"image"})
+            if cached_image is not None:
+                return {"ui": cached_ui, "result": (cached_image,)}
+            passthrough = _passthrough_image_tensor(kwargs)
+            if passthrough is not None:
+                return {"ui": {}, "result": (passthrough,)}
+            raise CometAPIError(comet_freeze_missing_message("图像"))
+
         channel = str(channel or "").lower()
         if channel not in get_image_channel_choices():
             return self._error(f"不支持的渠道：{channel}")
@@ -9237,7 +9518,16 @@ class CometAPIUnifiedImage:
                 if len(all_errors) > 3:
                     warning += f"；另外还有 {len(all_errors) - 3} 个失败"
                 ui["comet_warning"] = [warning]
-            return {"ui": ui, "result": (pil_to_tensor(all_images),)}
+            output_tensor = pil_to_tensor(all_images)
+            try:
+                saved_refs, _saved_images = save_asset_images(output_tensor, prefix="CometAPIImage")
+                if saved_refs:
+                    ui["asset_ref"] = [asset_refs_to_json(saved_refs)]
+                    ui["asset_index"] = [0]
+                    remember_comet_run_result(kwargs.get("_unique_id"), "image", asset_refs=saved_refs)
+            except Exception as cache_exc:
+                logger.warning(f"Failed to cache Comet image result: {redact_sensitive_text(cache_exc)}")
+            return {"ui": ui, "result": (output_tensor,)}
         except Exception as exc:
             print_sanitized_exception(exc)
             return self._error(format_error_message(exc))
@@ -9315,7 +9605,7 @@ class CometAPIBatchImage:
         }
         for i in range(1, MAX_IMAGE_INPUTS + 1):
             inputs["optional"][f"image_{i}"] = ("IMAGE",)
-        return inputs
+        return add_comet_execution_inputs(inputs)
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -9895,6 +10185,18 @@ class CometAPIBatchImage:
         batch_text=None,
         **kwargs,
     ):
+        if is_comet_global_freeze_run(kwargs):
+            cached_image, cached_ui, cached_summary = _cached_image_payload(kwargs.get("_unique_id"), {"batch_image"})
+            if cached_image is not None:
+                summary = cached_summary or "总 Run 冻结：复用上次批量图像结果。"
+                cached_ui.setdefault("comet_text", [summary])
+                return {"ui": cached_ui, "result": (cached_image, summary)}
+            passthrough = _passthrough_image_tensor(kwargs)
+            if passthrough is not None:
+                summary = "总 Run 冻结：已透传输入图像，未触发 Comet 批量生图。"
+                return {"ui": {"comet_text": [summary]}, "result": (passthrough, summary)}
+            raise CometAPIError(comet_freeze_missing_message("批量图像"))
+
         channel = str(channel or "").lower()
         if channel not in get_image_channel_choices():
             return self._error(f"不支持的渠道：{channel}")
@@ -10096,6 +10398,12 @@ class CometAPIBatchImage:
                 remember_batch_asset_refs(
                     kwargs.get("_unique_id"),
                     [item["asset_ref"] for item in preview_results],
+                )
+                remember_comet_run_result(
+                    kwargs.get("_unique_id"),
+                    "batch_image",
+                    text=summary,
+                    asset_refs=[item["asset_ref"] for item in preview_results],
                 )
             return {
                 "ui": ui,
@@ -10670,7 +10978,7 @@ class CometAPIUnifiedMusic:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {
+        inputs = {
             "required": {
                 "channel": (get_music_channel_choices(), {"default": get_default_music_channel()}),
                 "music_mode": (MUSIC_MODES, {"default": MUSIC_MODE_GENERATE}),
@@ -10683,6 +10991,7 @@ class CometAPIUnifiedMusic:
                 "vocal_gender": (MUSIC_VOCAL_GENDERS, {"default": MUSIC_VOCAL_GENDERS[0]}),
             },
         }
+        return add_comet_execution_inputs(inputs)
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -10839,6 +11148,14 @@ class CometAPIUnifiedMusic:
         api_key: str = "",
         **kwargs,
     ):
+        if is_comet_global_freeze_run(kwargs):
+            cached_audio, cached_ui, cached_summary = _cached_audio_payload(kwargs.get("_unique_id"))
+            if cached_audio is not None:
+                summary = cached_summary or "总 Run 冻结：复用上次音乐结果。"
+                cached_ui.setdefault("comet_text", [summary])
+                return {"ui": cached_ui, "result": (cached_audio, summary)}
+            raise CometAPIError(comet_freeze_missing_message("音乐"))
+
         channel_key = str(channel or get_default_music_channel()).lower()
         private_channel = get_private_channel_spec(channel_key)
         if channel_key not in get_music_channel_choices():
@@ -10870,6 +11187,13 @@ class CometAPIUnifiedMusic:
                     timeout=timeout,
                 )
                 ui = {"comet_text": [summary], **(ui or {})}
+                try:
+                    refs = _ensure_audio_asset_refs(audio_result, "CometAPIMusic")
+                    if refs:
+                        ui["asset_ref"] = [asset_refs_to_json(refs)]
+                    remember_comet_run_result(kwargs.get("_unique_id"), "music", text=summary, asset_refs=refs)
+                except Exception as cache_exc:
+                    logger.warning(f"Failed to cache Comet music result: {redact_sensitive_text(cache_exc)}")
                 return {"ui": ui, "result": (audio_result, summary)}
             api = RunningHubMusicAPI(final_api_key) if channel_key == "runninghub" else PrivateMusicAPI(final_api_key, get_channel_api_url(channel_key))
             prompt = str(prompt or "").strip()
@@ -10895,6 +11219,7 @@ class CometAPIUnifiedMusic:
                     title=title,
                     lyrics=lyrics,
                 )
+                remember_comet_run_result(kwargs.get("_unique_id"), "music", text=summary)
                 return {"ui": {"comet_text": [summary], "comet_task_id": [task_id]}, "result": (silent_audio(), summary)}
 
             if channel_key == "runninghub":
@@ -10976,7 +11301,15 @@ class CometAPIUnifiedMusic:
                 audio_path="\n".join(saved_paths),
                 lyrics=lyrics,
             )
-            return {"ui": {"comet_text": [summary], "comet_task_id": [task_id]}, "result": (audio_result, summary)}
+            ui = {"comet_text": [summary], "comet_task_id": [task_id]}
+            try:
+                refs = _ensure_audio_asset_refs(audio_result, "CometAPIMusic")
+                if refs:
+                    ui["asset_ref"] = [asset_refs_to_json(refs)]
+                remember_comet_run_result(kwargs.get("_unique_id"), "music", text=summary, asset_refs=refs, task_id=task_id)
+            except Exception as cache_exc:
+                logger.warning(f"Failed to cache Comet music result: {redact_sensitive_text(cache_exc)}")
+            return {"ui": ui, "result": (audio_result, summary)}
         except Exception as exc:
             print_sanitized_exception(exc)
             return self._error(format_error_message(exc))
@@ -11100,6 +11433,7 @@ def run_private_llm_channel(
     audio_paths: list[str],
     messages: list,
     api_format: str,
+    system_prompt: str = "",
 ) -> tuple[str, str]:
     spec = get_private_channel_spec(channel)
     if not spec:
@@ -11125,6 +11459,7 @@ def run_private_llm_channel(
         resolution="",
         mode="",
     )
+    context["system_prompt"] = str(system_prompt or "")
     result = generate(context)
     if isinstance(result, dict):
         return str(result.get("text") or result.get("response") or result.get("content") or ""), str(result.get("error") or "")
@@ -11326,7 +11661,7 @@ class CometAPIUnifiedVideo:
         for i in range(1, MAX_VIDEO_MEDIA_INPUTS + 1):
             inputs["optional"][f"media_{i}"] = (COMET_ANY,)
             inputs["optional"][f"media_type_{i}"] = ("STRING", {"default": ""})
-        return inputs
+        return add_comet_execution_inputs(inputs)
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -11396,6 +11731,15 @@ class CometAPIUnifiedVideo:
         api_key: str = "",
         **kwargs,
     ):
+        if is_comet_global_freeze_run(kwargs):
+            cached_video, cached_ui, _text = _cached_video_payload(kwargs.get("_unique_id"), {"video"})
+            if cached_video is not None:
+                return {"ui": cached_ui, "result": (cached_video,)}
+            passthrough = _passthrough_video(kwargs)
+            if passthrough is not None:
+                return {"ui": {}, "result": (passthrough,)}
+            raise CometAPIError(comet_freeze_missing_message("视频"))
+
         channel_key = str(channel or get_default_video_channel()).lower()
         private_channel = get_private_channel_spec(channel_key)
         if channel_key not in get_video_channel_choices():
@@ -11503,6 +11847,18 @@ class CometAPIUnifiedVideo:
                 "comet_video_url": [video_url],
                 "comet_task_id": [task_id],
             }
+            try:
+                video_ref = asset_ref_from_path(path)
+                ui["asset_ref"] = [asset_ref_to_json(video_ref)]
+                remember_comet_run_result(
+                    kwargs.get("_unique_id"),
+                    "video",
+                    asset_refs=[video_ref],
+                    video_url=video_url,
+                    task_id=task_id,
+                )
+            except Exception as cache_exc:
+                logger.warning(f"Failed to cache Comet video result: {redact_sensitive_text(cache_exc)}")
             return {"ui": ui, "result": (VideoAdapter(path, video_url=video_url),)}
         except Exception as exc:
             print_sanitized_exception(exc)
@@ -12615,6 +12971,12 @@ class CometAPIAsyncImage(CometAPIUnifiedImage):
         api_key: str = "",
         **kwargs,
     ):
+        if is_comet_global_freeze_run(kwargs):
+            cached_text = _cached_text_payload(kwargs.get("_unique_id"), {"async_text"})
+            if cached_text:
+                return self._text_result(cached_text)
+            raise CometAPIError(comet_freeze_missing_message("异步图像提交"))
+
         channel = str(channel or "").lower()
         if channel not in get_image_channel_choices():
             return self._text_result(f"不支持的渠道：{channel}", True)
@@ -12709,6 +13071,7 @@ class CometAPIAsyncImage(CometAPIUnifiedImage):
             for subtask, payload in local_jobs:
                 schedule_local_wrapped_image_subtask(task_id, subtask, payload)
             message = f"异步图片提交成功 | {task_id} | 模型: {actual_models[0] if actual_models else model} | 子任务数: {len(subtasks)}"
+            remember_comet_run_result(kwargs.get("_unique_id"), "async_text", text=message, task_id=task_id)
             return self._text_result(message)
         except Exception as exc:
             print_sanitized_exception(exc)
@@ -12751,6 +13114,12 @@ class CometAPIAsyncBatchImage(CometAPIBatchImage):
         batch_text=None,
         **kwargs,
     ):
+        if is_comet_global_freeze_run(kwargs):
+            cached_text = _cached_text_payload(kwargs.get("_unique_id"), {"async_text"})
+            if cached_text:
+                return self._text_result(cached_text)
+            raise CometAPIError(comet_freeze_missing_message("异步批量图像提交"))
+
         channel = str(channel or "").lower()
         if channel not in get_image_channel_choices():
             return self._text_result(f"不支持的渠道：{channel}", True)
@@ -12847,6 +13216,7 @@ class CometAPIAsyncBatchImage(CometAPIBatchImage):
                 message = f"异步批量图片提交完成 | {task_id} | 子任务数: {len(subtasks)}"
                 if warnings:
                     message += "\n提示：" + "；".join(warnings)
+                remember_comet_run_result(kwargs.get("_unique_id"), "async_text", text=message, task_id=task_id)
                 return self._text_result(message)
 
             def submit_one(index_and_task):
@@ -12912,6 +13282,7 @@ class CometAPIAsyncBatchImage(CometAPIBatchImage):
                 message += "\n提示：" + "；".join(warnings)
             if errors:
                 message += "\n失败示例：" + "；".join(errors[:3])
+            remember_comet_run_result(kwargs.get("_unique_id"), "async_text", text=message, task_id=task_id)
             return self._text_result(message)
         except Exception as exc:
             print_sanitized_exception(exc)
@@ -12946,6 +13317,12 @@ class CometAPIAsyncVideo(CometAPIUnifiedVideo):
         api_key: str = "",
         **kwargs,
     ):
+        if is_comet_global_freeze_run(kwargs):
+            cached_text = _cached_text_payload(kwargs.get("_unique_id"), {"async_text"})
+            if cached_text:
+                return self._text_result(cached_text)
+            raise CometAPIError(comet_freeze_missing_message("异步视频提交"))
+
         channel_key = str(channel or get_default_video_channel()).lower()
         if channel_key not in get_video_channel_choices():
             return self._text_result(f"不支持的视频渠道：{channel}", True)
@@ -13029,6 +13406,7 @@ class CometAPIAsyncVideo(CometAPIUnifiedVideo):
             if local_payload is not None:
                 schedule_local_wrapped_video_subtask(task_id, subtask, local_payload)
             message = f"异步视频提交成功 | {task_id} | 模型: {actual_model}"
+            remember_comet_run_result(kwargs.get("_unique_id"), "async_text", text=message, task_id=task_id)
             return self._text_result(message)
         except Exception as exc:
             print_sanitized_exception(exc)
@@ -13073,11 +13451,12 @@ class CometAPIAsyncImageReceiver:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {
+        inputs = {
             "required": {
                 "run_count": ("INT", {"default": 1, "min": 1, "max": 50, "step": 1, "display_name": "运行次数"}),
             }
         }
+        return add_comet_execution_inputs(inputs)
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -13135,7 +13514,16 @@ class CometAPIAsyncImageReceiver:
         update_comet_async_task(task_id, {"status": "downloaded", "downloaded_at": _async_now(), "result_count": len(pil_images)})
         return _batch_image_tensor(pil_images), len(pil_images), errors
 
-    def receive(self, run_count: int = 1):
+    def receive(self, run_count: int = 1, **kwargs):
+        if is_comet_global_freeze_run(kwargs):
+            cached_image, cached_ui, cached_text = _cached_image_payload(kwargs.get("_unique_id"), {"async_image"})
+            if cached_image is not None:
+                text = cached_text or "总 Run 冻结：复用上次异步图片收取结果。"
+                cached_ui.setdefault("comet_text", [text])
+                cached_ui.setdefault("string", [text])
+                return {"ui": cached_ui, "result": (cached_image, text)}
+            raise CometAPIError(comet_freeze_missing_message("异步图片收取"))
+
         try:
             refresh_comet_async_tasks("image")
             ready_tasks = _ready_async_tasks("image", _normalize_async_receive_count(run_count))
@@ -13164,6 +13552,11 @@ class CometAPIAsyncImageReceiver:
                     final_text += "\n提示：" + "；".join(warnings[:3])
                 if failures:
                     final_text += "\n未收取：" + "；".join(failures[:3])
+                try:
+                    saved_refs, _saved_images = save_asset_images(last_image, prefix="CometAPIAsyncImage")
+                    remember_comet_run_result(kwargs.get("_unique_id"), "async_image", text=final_text, asset_refs=saved_refs)
+                except Exception as cache_exc:
+                    logger.warning(f"Failed to cache async image receiver result: {redact_sensitive_text(cache_exc)}")
                 return self._result(last_image, final_text)
             failure_text = "；".join(failures[:5]) if failures else "没有可收取的图片结果。"
             return self._result(None, f"收取图片结果失败：{failure_text}\n{status_text}", True)
@@ -13181,11 +13574,12 @@ class CometAPIAsyncVideoReceiver:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {
+        inputs = {
             "required": {
                 "run_count": ("INT", {"default": 1, "min": 1, "max": 50, "step": 1, "display_name": "运行次数"}),
             }
         }
+        return add_comet_execution_inputs(inputs)
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -13230,7 +13624,16 @@ class CometAPIAsyncVideoReceiver:
         update_comet_async_task(task_id, {"status": "downloaded", "downloaded_at": _async_now(), "video_url": video_url, "local_path": path})
         return VideoAdapter(path, video_url=video_url), os.path.basename(path)
 
-    def receive(self, run_count: int = 1):
+    def receive(self, run_count: int = 1, **kwargs):
+        if is_comet_global_freeze_run(kwargs):
+            cached_video, cached_ui, cached_text = _cached_video_payload(kwargs.get("_unique_id"), {"async_video"})
+            if cached_video is not None:
+                text = cached_text or "总 Run 冻结：复用上次异步视频收取结果。"
+                cached_ui.setdefault("comet_text", [text])
+                cached_ui.setdefault("string", [text])
+                return {"ui": cached_ui, "result": (cached_video, text)}
+            raise CometAPIError(comet_freeze_missing_message("异步视频收取"))
+
         try:
             refresh_comet_async_tasks("video")
             ready_tasks = _ready_async_tasks("video", _normalize_async_receive_count(run_count))
@@ -13254,6 +13657,13 @@ class CometAPIAsyncVideoReceiver:
                 final_text = f"收取成功: {len(received)} 个视频任务 | {details}\n{status_text}"
                 if failures:
                     final_text += "\n未收取：" + "；".join(failures[:3])
+                try:
+                    path = getattr(last_video, "video_path", "") if last_video is not None else ""
+                    ref = asset_ref_from_path(path) if path else None
+                    if ref:
+                        remember_comet_run_result(kwargs.get("_unique_id"), "async_video", text=final_text, asset_refs=[ref], video_url=getattr(last_video, "video_url", ""))
+                except Exception as cache_exc:
+                    logger.warning(f"Failed to cache async video receiver result: {redact_sensitive_text(cache_exc)}")
                 return self._result(last_video, final_text)
             failure_text = "；".join(failures[:5]) if failures else "没有可收取的视频结果。"
             return self._result(None, f"收取视频结果失败：{failure_text}\n{status_text}", True)
@@ -14075,7 +14485,7 @@ def _run_partial_blocking(prompt: dict, prompt_id: str, extra_data: dict, target
     except Exception:
         cache_type = False
 
-    executor = PromptExecutor(srv, cache_type=cache_type, cache_args={"lru": 0, "ram": 0})
+    executor = PromptExecutor(srv, cache_type=cache_type, cache_args={"lru": 0, "ram": 0, "ram_inactive": 0})
     external_item_id = None
     try:
         external_item = _make_external_queue_item(prompt_id, prompt, extra_data, target_ids, client_id)
