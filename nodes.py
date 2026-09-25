@@ -164,7 +164,14 @@ NANO_BANANA_MODELS = [
     "nano-banana-2",
     "nano-banana-2-cl",
 ]
-GPT_IMAGE_MODELS = ["gpt-image-2", "gpt-image-2-vip"]
+GPT_IMAGE_MODELS = [
+    "gpt-image-2",
+    "gpt-image-2-vip",
+    "gpt-image-2.5",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
+]
+GPT_IMAGE_VIP_MODELS = {"gpt-image-2-vip", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"}
 PRIVATE_MODELS = [
     "gpt-image-2",
     "gpt-image-2-all",
@@ -719,6 +726,7 @@ GPT_IMAGE_VIP_SIZE_MAP = {
     "1:2": {"1K": "880x1760", "2K": "1456x2912", "4K": "1920x3840"},
 }
 GPT_IMAGE_QUALITY_VALUES = ["low", "medium", "high"]
+GPT_IMAGE_SUNBURST_QUALITY_VALUES = GPT_IMAGE_QUALITY_VALUES + ["xhigh", "max"]
 PRIVATE_GEMINI_ASPECT_RATIOS = ["auto", "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
 PRIVATE_SEEDREAM_ASPECT_RATIOS = ["auto", "1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "21:9"]
 PRIVATE_GPT_IMAGE_ASPECT_RATIOS = GPT_IMAGE_ASPECT_RATIOS
@@ -3766,15 +3774,16 @@ class GrsaiAPI:
             "urls": urls,
             "shutProgress": True,
         }
-        if model == "gpt-image-2-vip":
+        if model in GPT_IMAGE_VIP_MODELS:
             if aspect_ratio == "auto":
                 aspect_ratio = auto_aspect_ratio if auto_aspect_ratio in GPT_IMAGE_VIP_SIZE_MAP else "1:1"
             size = image_size if image_size in {"1K", "2K", "4K"} else "2K"
             mapped_size = GPT_IMAGE_VIP_SIZE_MAP.get(aspect_ratio, {}).get(size)
             if not mapped_size:
-                raise CometAPIError(f"gpt-image-2-vip 不支持这个尺寸：{aspect_ratio} / {size}")
+                raise CometAPIError(f"{model} 不支持这个尺寸：{aspect_ratio} / {size}")
             payload["aspectRatio"] = mapped_size
-            payload["quality"] = quality if quality in GPT_IMAGE_QUALITY_VALUES else "medium"
+            quality_values = GPT_IMAGE_SUNBURST_QUALITY_VALUES if model == "gpt-image-2.5-sunburst" else GPT_IMAGE_QUALITY_VALUES
+            payload["quality"] = quality if quality in quality_values else "medium"
         else:
             payload["aspectRatio"] = aspect_ratio if aspect_ratio in GPT_IMAGE_ASPECT_RATIOS else "auto"
 
@@ -9228,7 +9237,7 @@ class CometAPIUnifiedImage:
                 "concurrency": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
                 "aspect_ratio": (SUPPORTED_ASPECT_RATIOS, {"default": "auto"}),
                 "image_size": (["1K", "2K", "3K", "4K", "8K"], {"default": "2K"}),
-                "quality": (GPT_IMAGE_QUALITY_VALUES, {"default": "medium"}),
+                "quality": (GPT_IMAGE_SUNBURST_QUALITY_VALUES, {"default": "medium"}),
                 "reasoning_effort": (IMAGE_REASONING_EFFORT_VALUES, {"default": "medium"}),
                 "background_mode": (IMAGE_BACKGROUND_MODE_VALUES, {"default": "默认"}),
             },
@@ -9591,7 +9600,7 @@ class CometAPIBatchImage:
                 "concurrency": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
                 "aspect_ratio": (SUPPORTED_ASPECT_RATIOS, {"default": "auto"}),
                 "image_size": (["1K", "2K", "3K", "4K", "8K"], {"default": "2K"}),
-                "quality": (GPT_IMAGE_QUALITY_VALUES, {"default": "medium"}),
+                "quality": (GPT_IMAGE_SUNBURST_QUALITY_VALUES, {"default": "medium"}),
                 "reasoning_effort": (IMAGE_REASONING_EFFORT_VALUES, {"default": "medium"}),
                 "background_mode": (IMAGE_BACKGROUND_MODE_VALUES, {"default": "默认"}),
             },
@@ -12390,7 +12399,7 @@ def _build_grsai_async_image_payload(
             "shutProgress": True,
             "webHook": "-1",
         }
-        if model == "gpt-image-2-vip":
+        if model in GPT_IMAGE_VIP_MODELS:
             resolved_ratio = aspect_ratio
             if resolved_ratio == "auto":
                 resolved_ratio = nearest_aspect_ratio("auto", pil_refs, list(GPT_IMAGE_VIP_SIZE_MAP.keys()), "1:1")
@@ -12398,9 +12407,10 @@ def _build_grsai_async_image_payload(
             safe_size = target_size if target_size in {"1K", "2K", "4K"} else "2K"
             mapped_size = GPT_IMAGE_VIP_SIZE_MAP.get(resolved_ratio, {}).get(safe_size)
             if not mapped_size:
-                raise CometAPIError(f"gpt-image-2-vip 不支持这个尺寸：{resolved_ratio} / {safe_size}")
+                raise CometAPIError(f"{model} 不支持这个尺寸：{resolved_ratio} / {safe_size}")
             payload["aspectRatio"] = mapped_size
-            payload["quality"] = quality if quality in GPT_IMAGE_QUALITY_VALUES else "medium"
+            quality_values = GPT_IMAGE_SUNBURST_QUALITY_VALUES if model == "gpt-image-2.5-sunburst" else GPT_IMAGE_QUALITY_VALUES
+            payload["quality"] = quality if quality in quality_values else "medium"
         else:
             payload["aspectRatio"] = aspect_ratio if aspect_ratio in GPT_IMAGE_ASPECT_RATIOS else "auto"
         return "/v1/draw/completions", payload, model
